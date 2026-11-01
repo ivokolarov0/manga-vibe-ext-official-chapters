@@ -12,16 +12,28 @@ It only runs when you press a button:
 - **Check all series** in Settings → Plugins → Official chapters: checks the whole library in the
   background. Progress shows on that page.
 
-The result shows on the series page as **Official chapters**, e.g. `201 (Shonen Jump+) · AniList says 210`.
+The result shows under the series' **Details**:
+
+```
+Official chapters   201 (Shonen Jump+) · AniList says 210
+Official sources    Piccoma: 198
+                    Shonen Jump+: 201
+                    ComicWalker: no chapter number found
+                    MangaUpdates: 199
+```
 
 ## Where it looks
 
-It uses the links the series already has (from AniList and MangaUpdates), in this order. The first
-one that gives a number wins:
+It uses the links the series already has (from AniList and MangaUpdates):
 
-1. **Sites in the original language** (Japanese, Korean, Chinese): they have every chapter that's out.
-2. **MangaUpdates**: the original edition's count, e.g. "120 Chapters (Ongoing)".
-3. **English sites** (MANGA Plus, Manga UP!, K MANGA, VIZ...): only the translated chapters.
+1. **Every site in the original language** (Japanese, Korean, Chinese): they have every chapter that's out.
+2. **MangaUpdates**: the original edition's count, e.g. "120 Chapters (Ongoing)". Always asked too.
+3. **English sites** (MANGA Plus, Manga UP!, K MANGA, VIZ, Omoi...): only when 1 and 2 gave no
+   number, since they have only the translated chapters.
+
+**Official sources** lists every source asked and its number, so you can compare them.
+**Official chapters** is the highest original-language number (one site can be behind the others),
+else MangaUpdates', else the highest English one.
 
 How each page is read:
 
@@ -29,10 +41,11 @@ How each page is read:
 |---|---|
 | Shonen Jump+, Comic Days, Magazine Pocket and other GigaViewer sites | the series' RSS feed |
 | Manga UP! | the chapter list in the page's data |
-| any other site | the page's text goes to your Ollama model, if you set one (see below) |
+| any other site | the chapter labels in the page's text (`第12話`, `Chapter 12`, `Chapters 44-47`) |
+| a page without any | its text goes to your Ollama model, if you set one (see below) |
 
-Only extras, specials, previews and announcements without a number are left out; `Chapter 44.4`
-counts as chapter 44.
+Extras, specials, previews and announcements without a number are left out. `Chapter 44.4`
+counts as chapter 44, and a range like `Chapters 44-47` (a store's volume) as 47.
 
 Shops that only list volumes (Yen Press, Kodansha US, Seven Seas...) and sites in other languages
 (e.g. French) are skipped.

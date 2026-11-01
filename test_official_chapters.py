@@ -63,7 +63,7 @@ def set_links(sid, urls, **values):
 
 def field(client, sid):
     s = client.get(f"/api/series/{sid}").json()
-    return next((f["value"] for f in s["plugin_fields"] if f["plugin"] == PID), None)
+    return next((f["value"] for f in s["plugin_fields"] if f["plugin"] == PID and f["key"] == "official_chapters"), None)
 
 
 def check(client, sid):
@@ -98,6 +98,11 @@ def test_chapter_numbers():
     assert m.newest(["Chapter 44.4", "Special Extra", "Ch. 12"]) == 44
     assert m.newest(["Episode 7", "#8 The end"]) == 8
     assert m.newest(["Volume 12", "Extra"]) is None
+    # ranges (a store's volumes, e.g. Omoi): the last number counts
+    assert m.newest(["Chapter 23", "Chapters 24-27 Buy Volume 7", "Chapters 44-47 Buy Volume 12"]) == 47
+    assert m.newest(["Chapters 44 – 47"]) == 47
+    assert m.newest(["第1～4話", "第5〜8話"]) == 8
+    assert m.newest(["Chapter 44.4-45"]) == 45
     assert m.mu_chapters("8 Volumes (Complete)") is None
     assert m.mu_chapters("12 Volumes (Ongoing)\n110 Chapters") == 110
 
@@ -108,22 +113,37 @@ def test_site_order():
     assert m.tier("https://www.ganganonline.com/contents/x/") == 0
     assert m.tier("https://mangaplus.shueisha.co.jp/titles/1") == 2  # .co.jp, but English
     assert m.tier("https://www.viz.com/one-piece") == 2
+    assert m.tier("https://www.omoi.com/series/real-girl") == 2
     assert m.tier("https://yenpress.com/series/x") is None          # volumes only
     assert m.tier("https://www.kana.fr/series/x") is None            # French: not used
 
 
 # ---------------------------------------------------------------- whole check
 
-def test_japanese_site_first(client, web):
+def field_of(client, sid, key):
+    s = client.get(f"/api/series/{sid}").json()
+    return next((f["value"] for f in s["plugin_fields"] if f["plugin"] == PID and f["key"] == key), None)
+
+
+def test_every_japanese_site_and_mangaupdates(client, web):
     web.pages["https://shonenjumpplus.com/episode/1"] = (200, JUMP_PAGE)
     web.pages["https://shonenjumpplus.com/rss/series/123"] = (200, JUMP_RSS)
+    web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li><li>第197話</li>")
+    web.pages["https://comic-walker.com/detail/3"] = (403, "Forbidden")
+    web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (
+        200, json.dumps({"status": "20 Volumes (Ongoing)\n199 Chapters"}))
     web.pages["https://global.manga-up.com/manga/24"] = (200, MANGA_UP)
     set_links(web.sid, [("Manga UP!", "https://global.manga-up.com/manga/24"),
-                        ("Shonen Jump+", "https://shonenjumpplus.com/episode/1")],
+                        ("Piccoma", "https://piccoma.com/web/product/9"),
+                        ("Shonen Jump+", "https://shonenjumpplus.com/episode/1"),
+                        ("ComicWalker", "https://comic-walker.com/detail/3")],
               chapters_total=210, mangaupdates_id="47567127096")
-    assert "chapter 201" in check(client, web.sid)["message"]
-    assert field(client, web.sid) == "201 (Shonen Jump+) · AniList says 210"
-    assert not any("manga-up" in u or "mangaupdates" in u for u in web.asked)  # stopped at the first answer
+    msg = check(client, web.sid)["message"]
+    assert "chapter 201" in msg and "3 more sources" in msg
+    assert field_of(client, web.sid, "official_chapters") == "201 (Shonen Jump+) · AniList says 210"
+    assert field_of(client, web.sid, "official_sources").split("\n") == [
+        "Piccoma: 198", "Shonen Jump+: 201", "ComicWalker: no chapter number found", "MangaUpdates: 199"]
+    assert not any("manga-up" in u for u in web.asked)  # English only when nothing else had a number
 
 
 def test_mangaupdates_before_english(client, web):
@@ -152,7 +172,8 @@ def test_ai_reads_other_pages(client, web):
     with SessionLocal() as db:
         Context(manager.get(PID), db).save_settings({"ollama_url": "pc:11434"})
         db.commit()
-    web.pages["https://comic-walker.com/detail/1"] = (200, "<p>第1話</p><p>第12話 最新話</p><p>番外編</p>")
+    # no chapter labels the plugin knows ("12" alone), so the model reads it
+    web.pages["https://comic-walker.com/detail/1"] = (200, "<p>最新: 12</p><p>番外編</p>")
     set_links(web.sid, [("ComicWalker", "https://comic-walker.com/detail/1")], mangaupdates_id=None)
     web.ai_answer = 12
     check(client, web.sid)
@@ -164,8 +185,25 @@ def test_ai_reads_other_pages(client, web):
     assert "No official chapter count" in check(client, web.sid)["message"]
 
 
+def test_chapter_labels_on_the_page_before_ai(client, web):
+    from app.db import SessionLocal
+    from app.plugins import Context, manager
+    with SessionLocal() as db:
+        Context(manager.get(PID), db).save_settings({"ollama_url": "pc:11434"})
+        db.commit()
+    web.pages["https://www.omoi.com/series/real-girl"] = (200, (
+        "<a>Chapter 1</a><a>Chapter 23</a><p>Published 2026-01-26</p>"
+        "<a>Chapters 24-27<br>Buy Volume 7 to unlock</a><a>Chapters 44-47<br>Buy Volume 12 to unlock</a>"))
+    set_links(web.sid, [("Omoi", "https://www.omoi.com/series/real-girl")], mangaupdates_id=None,
+              chapters_total=None)
+    web.ai_answer = 26  # a wrong reading that is on the page: never asked
+    check(client, web.sid)
+    assert field(client, web.sid) == "47 (Omoi)"
+    assert not any(u.endswith("/api/chat") for u in web.asked)
+
+
 def test_without_ollama_other_pages_are_skipped(client, web):
-    web.pages["https://comic-walker.com/detail/2"] = (200, "<p>第12話</p>")
+    web.pages["https://comic-walker.com/detail/2"] = (200, "<p>最新話はこちら</p>")
     set_links(web.sid, [("ComicWalker", "https://comic-walker.com/detail/2")], mangaupdates_id=None)
     assert "No official chapter count" in check(client, web.sid)["message"]
     assert not any(u.endswith("/api/chat") for u in web.asked)
