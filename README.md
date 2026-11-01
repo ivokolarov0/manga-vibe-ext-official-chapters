@@ -29,12 +29,14 @@ It uses the links the series already has (from AniList and MangaUpdates):
 
 1. **Every site in the original language** (Japanese, Korean, Chinese): they have every chapter that's out.
 2. **MangaUpdates**: the original edition's count, e.g. "120 Chapters (Ongoing)". Always asked too.
-3. **English sites** (MANGA Plus, Manga UP!, K MANGA, VIZ, Omoi...): only when 1 and 2 gave no
+3. **A web search**: when no original-language site gave a number, even if MangaUpdates did, since
+   its count can be wrong (see below).
+4. **English sites** (MANGA Plus, Manga UP!, K MANGA, VIZ, Omoi...): only when 1 to 3 gave no
    number, since they have only the translated chapters.
 
 **Official sources** lists every source asked and its number, so you can compare them (one site can
-be behind the others). The button's message names the highest original-language number, else
-MangaUpdates', else the highest English one.
+be behind the others). The button's message names the highest number from the original-language
+sites and the web search, else MangaUpdates', else the highest English one.
 
 How each page is read:
 
@@ -44,7 +46,7 @@ How each page is read:
 | Manga UP! | the chapter list in the page's data |
 | any other site | the chapter labels in the page's text (`第12話`, `Chapter 12`, `Chapters 44-47`) |
 | a page without any | its text goes to your Ollama model, if you set one (see below) |
-| no link gave a number | a DuckDuckGo search, read by your Ollama model (see below) |
+| no original-language site gave a number | a DuckDuckGo search, read by your Ollama model (see below) |
 
 Extras, specials, previews and announcements without a number are left out. `Chapter 44.4`
 counts as chapter 44, and a range like `Chapters 44-47` (a store's volume) as 47.
@@ -67,8 +69,9 @@ next link.
 
 ## Web search (optional)
 
-When none of the series' links gives a number, the plugin searches DuckDuckGo (its plain HTML page:
-free, no account or key). It searches for the Japanese title with 漫画 最新話 ("manga, newest
+When none of the series' original-language sites gives a number, the plugin searches DuckDuckGo (its
+plain HTML page: free, no account or key). That includes series where only MangaUpdates has a count,
+since MangaUpdates can be wrong. It searches for the Japanese title with 漫画 最新話 ("manga, newest
 chapter") and for the English title with "manga latest chapter".
 
 - **With an Ollama server set**, your model reads the results. It's told to ignore anime episodes,
@@ -78,8 +81,15 @@ chapter") and for the English title with "manga latest chapter".
 - **Without one** (or if the model has no answer), the plugin reads the titles of results from the
   official sites, e.g. `[第250話]ダンダダン | 少年ジャンプ＋`.
 
-The result shows as `Web search: 250` under **Official sources**. The **Web search** setting turns
-it off.
+The result shows as `Web search: 250` under **Official sources**, next to MangaUpdates' count to
+compare. The button names the web search's number before MangaUpdates', even if it's lower.
+
+The **Web search** setting has three choices:
+
+- **Unless an official site has a number** (the default): as above.
+- **Always**: for every series, also those an official site has a number for. The highest number
+  of the sites and the search is named.
+- **Off**.
 
 DuckDuckGo sometimes asks automated searches to prove they're human. The plugin doesn't try to get
 around that: the search is skipped (a warning in the log) and the series gets no number from it.
