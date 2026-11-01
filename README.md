@@ -74,16 +74,19 @@ next link.
 When none of the series' original-language sites gives a number, the plugin searches DuckDuckGo (its
 plain HTML page: free, no account or key). That includes series where only MangaUpdates has a count,
 since MangaUpdates can be wrong. It searches for the Japanese title with 漫画 最新話 ("manga, newest
-chapter") and for the English title with "manga latest chapter".
+chapter") and for the English title with "how many chapters", which finds databases like MyAnimeList,
+Wikipedia and Kenmei.
 
 - **With an Ollama server set**, your model reads the results and lists every site that gives a
   chapter count. It's told to ignore anime episodes, light novels, spoiler pages and series with
   similar names. Each number is only used if its own result shows it as a chapter label
   (`第250話`, `Chapter 250`, `Chapters: 48`), so a made-up number or an anime season is never shown.
 - The plugin also reads the titles of results from the official sites, e.g.
-  `[第250話]ダンダダン | 少年ジャンプ＋` (the only thing it reads without a model).
+  `[第250話]ダンダダン | 少年ジャンプ＋`, and opens the series' MyAnimeList page if the search finds
+  it, for its `Chapters: 21` (ongoing series show "Unknown" there). These work without a model.
 
-Every site it found gets its own line under **Official sources**, next to MangaUpdates' count:
+Every site it found (up to 10) gets its own line under **Official sources**, next to MangaUpdates'
+count, so you can compare them yourself:
 
 ```
 Official sources    charagoo.jp (web search): 250
