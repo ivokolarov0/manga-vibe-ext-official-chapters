@@ -27,6 +27,7 @@ class FakeWeb:
         self.asked = []       # urls requested, in order
         self.ai_answer = None  # what Ollama says
         self.ai_result = None  # which search result the model points to
+        self.ai_sources = None  # or every source it lists: [{"result_number", "last_chapter"}]
         self.search_results = []  # what DuckDuckGo finds: [(title, url, snippet)]
         self.searches = []        # what was searched for
         self.prompts = []         # what the model was asked
@@ -36,7 +37,10 @@ class FakeWeb:
         self.asked.append(url)
         if url.endswith("/api/chat"):
             self.prompts.append(json.loads(request.content)["messages"][0]["content"])
-            answer = {"last_chapter": self.ai_answer, "result_number": self.ai_result}
+            # a page: last_chapter; search results: sources (ai_sources, or ai_answer from result ai_result)
+            sources = self.ai_sources if self.ai_sources is not None else (
+                [{"result_number": self.ai_result, "last_chapter": self.ai_answer}] if self.ai_answer else [])
+            answer = {"last_chapter": self.ai_answer, "sources": sources}
             return httpx.Response(200, json={"message": {"content": json.dumps(answer)}})
         if url.startswith("https://html.duckduckgo.com/html/"):
             self.searches.append(request.url.params.get("q"))
@@ -159,20 +163,20 @@ def test_every_japanese_site_and_mangaupdates(client, web):
         db.commit()
     web.pages["https://shonenjumpplus.com/episode/1"] = (200, JUMP_PAGE)
     web.pages["https://shonenjumpplus.com/rss/series/123"] = (200, JUMP_RSS)
-    web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li><li>第197話</li>")
+    web.pages["https://comic-days.com/title/9"] = (200, "<li>第198話</li><li>第197話</li>")
     web.pages["https://comic-walker.com/detail/3"] = (403, "Forbidden")
     web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (
         200, json.dumps({"status": "20 Volumes (Ongoing)\n199 Chapters"}))
     web.pages["https://global.manga-up.com/manga/24"] = (200, MANGA_UP)
     set_links(web.sid, [("Manga UP!", "https://global.manga-up.com/manga/24"),
-                        ("Piccoma", "https://piccoma.com/web/product/9"),
+                        ("Comic Days","https://comic-days.com/title/9"),
                         ("Shonen Jump+", "https://shonenjumpplus.com/episode/1"),
                         ("ComicWalker", "https://comic-walker.com/detail/3")],
               chapters_total=210, mangaupdates_id="47567127096")
     msg = check(client, web.sid)["message"]
     assert "chapter 201" in msg and "3 more sources" in msg
     assert fields(client, web.sid) == {"official_sources": "\n".join([  # one list, the highest first
-        "Shonen Jump+: 201", "MangaUpdates: 199", "Piccoma: 198", "ComicWalker: no chapter number found"])}
+        "Shonen Jump+: 201", "MangaUpdates: 199", "Comic Days: 198", "ComicWalker: no chapter number found"])}
     assert not any("manga-up" in u for u in web.asked)  # English only when nothing else had a number
 
 
@@ -273,8 +277,8 @@ def test_official_result_titles_are_read_without_a_model(client, web):
         ("[第300話]ほかの漫画 | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/300", ""),  # another series
     ]
     msg = check(client, web.sid)["message"]
-    assert "chapter 250 (Web search)" in msg
-    assert field(client, web.sid) == "Web search: 250"
+    assert "chapter 250 (shonenjumpplus.com (web search))" in msg
+    assert field(client, web.sid) == "shonenjumpplus.com (web search): 250"  # one line per site, its highest
     assert web.searches[0] == "ダンダダン 漫画 最新話" and "Series B manga latest chapter" in web.searches
 
 
@@ -287,13 +291,13 @@ def test_the_model_reads_other_results(client, web):
                           ("ダンダダン 最新話 | コミシー", "https://comicy.jp/comic/view/3018",
                            "最新話は[第２５０話]ダンダダン（2026年10月27日公開）")]
     web.ai_answer, web.ai_result = 250, 2
-    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]
-    assert field(client, web.sid) == "Web search: 250\nComicWalker: no chapter number found"
+    assert "chapter 250 (comicy.jp (web search))" in check(client, web.sid)["message"]
+    assert field(client, web.sid) == "comicy.jp (web search): 250\nComicWalker: no chapter number found"
     assert "RESULT 2: ダンダダン 最新話" in web.prompts[-1] and "ネタバレ" in web.prompts[-1]
 
     # gemma4 once gave the chapter as the result number: the chapter label in result 2 still counts
     web.ai_answer, web.ai_result = 250, 250
-    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]
+    assert "chapter 250 (comicy.jp" in check(client, web.sid)["message"]
     web.ai_answer, web.ai_result = 2, 1  # "第2期" is the anime's season, not a chapter label
     assert "No official chapter count" in check(client, web.sid)["message"]
     assert field(client, web.sid) == "ComicWalker: no chapter number found\nWeb search: no chapter number found"
@@ -301,27 +305,48 @@ def test_the_model_reads_other_results(client, web):
     assert "No official chapter count" in check(client, web.sid)["message"]
 
 
-def test_the_model_comes_before_official_titles(client, web):
+SIX_HALF = [  # what DuckDuckGo found for SIX HALF, and one more site
+    ("SIX HALF chapters, Chapter 44.5 [End] - Niadd", "https://www.niadd.com/manga/SIX_HALF/chapters.html", ""),
+    ("Six Half - Manga | Kenmei", "https://www.kenmei.co/series/six-half", "Status: Finished Chapters: 48"),
+    ("Six Half | MangaBaka", "https://mangabaka.org/manga/1/Six-Half", "Chapters: 48 Volumes: 11"),
+]
+
+
+def test_every_web_source_is_listed_and_the_most_agreed_number_named(client, web):
+    settings(ollama_url="pc:11434")
+    set_links(web.sid, [], mangaupdates_id=None, title_native="シックス ハーフ", title_english="Series B")
+    web.search_results = SIX_HALF
+    web.ai_sources = [{"result_number": 1, "last_chapter": 44}, {"result_number": 2, "last_chapter": 48},
+                      {"result_number": 3, "last_chapter": 48}]
+    msg = check(client, web.sid)["message"]
+    assert "chapter 48 (2 of 3 sources agree)" in msg and "2 more sources" in msg
+    assert field(client, web.sid) == "\n".join([
+        "kenmei.co (web search): 48", "mangabaka.org (web search): 48", "niadd.com (web search): 44"])
+
+    # MangaUpdates gets a vote too: 44 twice and 48 twice is a tie, and the highest wins
+    web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (200, json.dumps({"status": "44 Chapters"}))
+    set_links(web.sid, [], mangaupdates_id="47567127096")
+    assert "chapter 48 (2 of 4 sources agree)" in check(client, web.sid)["message"]
+    web.ai_sources = [{"result_number": 1, "last_chapter": 44}, {"result_number": 2, "last_chapter": 48}]
+    web.search_results = SIX_HALF[:2]
+    assert "chapter 44 (2 of 3 sources agree)" in check(client, web.sid)["message"]  # MangaUpdates and Niadd
+
+
+def test_sources_that_disagree(client, web):
     settings(ollama_url="pc:11434")
     no_links(web)
     web.search_results = [("[第249話]ダンダダン | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/249", ""),
                           ("ダンダダン | コミシー", "https://comicy.jp/comic/view/3018", "最新話は第250話")]
-    web.ai_answer, web.ai_result = 250, 2
-    assert field_after_check(client, web) == "Web search: 250"
-    web.ai_answer, web.ai_result = None, None  # no answer: the official title instead
-    assert field_after_check(client, web) == "Web search: 249"
-
-
-def field_after_check(client, web):
-    check(client, web.sid)
-    return field(client, web.sid)
+    web.ai_answer, web.ai_result = 250, 2  # the model reads comicy; Jump+'s own title is read too
+    assert "chapter 250 (2 sources disagree, the highest)" in check(client, web.sid)["message"]
+    assert field(client, web.sid) == "comicy.jp (web search): 250\nshonenjumpplus.com (web search): 249"
 
 
 def test_no_web_search_when_the_links_have_a_number_or_its_off(client, web):
-    web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li>")
-    set_links(web.sid, [("Piccoma", "https://piccoma.com/web/product/9")], mangaupdates_id=None)
+    web.pages["https://comic-days.com/title/9"] = (200, "<li>第198話</li>")
+    set_links(web.sid, [("Comic Days","https://comic-days.com/title/9")], mangaupdates_id=None)
     check(client, web.sid)
-    assert field(client, web.sid) == "Piccoma: 198"
+    assert field(client, web.sid) == "Comic Days: 198"
     assert not web.searches
 
     settings(web_search="off")
@@ -338,25 +363,25 @@ def test_web_search_checks_mangaupdates(client, web):
     web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (200, MU_199)
     set_links(web.sid, [], mangaupdates_id="47567127096", title_native="ダンダダン", title_english="Series B")
     web.search_results = JUMP_250
-    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]
-    assert field(client, web.sid) == "Web search: 250\nMangaUpdates: 199"
+    assert "chapter 250 (2 sources disagree, the highest)" in check(client, web.sid)["message"]
+    assert field(client, web.sid) == "shonenjumpplus.com (web search): 250\nMangaUpdates: 199"
 
-    web.search_results = [("[第190話]ダンダダン | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/190", "")]
-    assert "chapter 190 (Web search)" in check(client, web.sid)["message"]  # before MangaUpdates, even if lower
+    web.search_results = [("[第199話]ダンダダン | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/199", "")]
+    assert "chapter 199 (2 of 2 sources agree)" in check(client, web.sid)["message"]
 
     web.search_results = []  # nothing found: MangaUpdates
     assert "chapter 199 (MangaUpdates)" in check(client, web.sid)["message"]
 
 
 def test_web_search_always_or_off(client, web):
-    web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li>")
+    web.pages["https://comic-days.com/title/9"] = (200, "<li>第198話</li>")
     web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (200, MU_199)
-    set_links(web.sid, [("Piccoma", "https://piccoma.com/web/product/9")], mangaupdates_id="47567127096",
+    set_links(web.sid, [("Comic Days","https://comic-days.com/title/9")], mangaupdates_id="47567127096",
               title_native="ダンダダン", title_english="Series B")
     web.search_results = JUMP_250
     settings(web_search="always")
-    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]  # the highest of site and search
-    assert field(client, web.sid) == "Web search: 250\nMangaUpdates: 199\nPiccoma: 198"
+    assert "chapter 250 (shonenjumpplus.com (web search))" in check(client, web.sid)["message"]  # the highest
+    assert field(client, web.sid) == "shonenjumpplus.com (web search): 250\nMangaUpdates: 199\nComic Days: 198"
 
     web.searches.clear()
     settings(web_search="off")
@@ -373,6 +398,7 @@ def test_store_episode_counts_arent_chapters(client, web):
     m = import_plugin()
     assert m.tier("https://mechacomic.jp/books/87286") is None  # not read as a link either
     assert m.tier("https://sp.handycomic.jp/product/1") is None
+    assert m.tier("https://piccoma.com/web/product/8181") is None  # "39話" there was about 23 chapters
     assert m.newest(["Chapters: 48"]) == 48
     settings(ollama_url="pc:11434")
     set_links(web.sid, [], mangaupdates_id=None, title_native="シックス ハーフ", title_english="Series B")
@@ -386,7 +412,7 @@ def test_store_episode_counts_arent_chapters(client, web):
     assert "No official chapter count" in check(client, web.sid)["message"]
     assert "mechacomic" not in web.prompts[-1]  # the store isn't even shown to the model
     web.ai_answer, web.ai_result = 48, 2
-    assert "chapter 48 (Web search)" in check(client, web.sid)["message"]
+    assert "chapter 48 (kenmei.co (web search))" in check(client, web.sid)["message"]
 
 
 def test_search_refused(client, web):
