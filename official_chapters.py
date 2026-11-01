@@ -18,7 +18,8 @@ How a page is read:
   counts as its last number). Only a page without any goes to an Ollama model (optional, set in
   Settings), and the model's answer is only used if that number is actually on the page.
 
-When none of that gives a number, the plugin searches DuckDuckGo (its plain HTML page: free, no key).
+When no original-language site gives a number (MangaUpdates' count can be wrong), the plugin also
+searches DuckDuckGo (its plain HTML page: free, no key); the Web search setting can make it always or never.
 An official site's result title like "[第250話]ダンダダン | 少年ジャンプ＋" is read like a page;
 otherwise the Ollama model (if set) reads the results, and its number is only used if it is in the
 result the model names.
@@ -69,12 +70,19 @@ SKIP_HOSTS = {
     "kadokawa.co.jp", "shogakukan-comic.jp", "shueisha.co.jp", "kc.kodansha.co.jp",
     "kodansha.co.jp", "anilist.co", "myanimelist.net", "mangaupdates.com", "twitter.com", "x.com",
 }
+# Japanese e-book stores that cut each volume into small paid parts and number those: "全172話" on
+# Mecha Comic is SIX HALF's 11 volumes, not its chapters. Skipped as links and in search results.
+# Subdomains count too (sp.handycomic.jp).
+STORE_HOSTS = {
+    "mechacomic.jp", "cmoa.jp", "booklive.jp", "ebookjapan.yahoo.co.jp", "renta.papy.co.jp",
+    "manga.line.me", "handycomic.jp", "k-manga.jp", "book.dmm.com",
+}
 
 # "第12話", "12話", "Chapter 12", "Ch. 12.5", "Episode 12", "Ep 12", "#12", and ranges:
 # "Chapters 44-47", "第1～4話" (a volume's worth on a store page). A range counts as its last number.
 _TO = r"(?:\.\d+)?(?:\s*[-–~〜]\s*(\d+))?"
 CHAPTER_RE = re.compile(
-    rf"第\s*(\d+){_TO}\s*[話回]|(\d+){_TO}\s*話|\b(?:chapters?|chs?|episodes?|eps?)\.?\s*(\d+){_TO}|#\s*(\d+)",
+    rf"第\s*(\d+){_TO}\s*[話回]|(\d+){_TO}\s*話|\b(?:chapters?|chs?|episodes?|eps?)\.?:?\s*(\d+){_TO}|#\s*(\d+)",
     re.I)
 MU_CHAPTERS_RE = re.compile(r"(\d+)\s*(?:chapters?|chs?\b|話)", re.I)
 
@@ -84,10 +92,15 @@ def _host(url):
     return host[4:] if host.startswith("www.") else host
 
 
+def is_store(url):
+    host = _host(url)
+    return any(host == h or host.endswith("." + h) for h in STORE_HOSTS)
+
+
 def tier(url):
     """0 original language, 2 English, None not used. (MangaUpdates is tier 1.)"""
     host = _host(url)
-    if not host or host in SKIP_HOSTS:
+    if not host or host in SKIP_HOSTS or is_store(url):
         return None
     if host in ENGLISH_HOSTS:
         return 2
@@ -137,7 +150,7 @@ def page_text(raw):
 class OfficialChapters(Plugin):
     id = "official-chapters"
     name = "Official chapters"
-    version = "0.3.0"
+    version = "0.4.0"
     description = "Finds the newest chapter on the series' official sites (Japanese first) and shows it next to AniList's count."
     repo = "ivokolarov0/manga-vibe-ext-official-chapters"
     permissions = [
@@ -153,9 +166,11 @@ class OfficialChapters(Plugin):
         SettingDef("ollama_url", "Ollama server (optional)",
                    help="e.g. http://192.168.1.20:11434. Reads sites the plugin has no parser for. Leave empty to skip them."),
         SettingDef("model", "Model", default="gemma4", help="Any text model works, e.g. gemma4 or qwen3"),
-        SettingDef("web_search", "Web search", default="on", options=[("on", "On"), ("off", "Off")],
-                   help="When the links give no number, search DuckDuckGo for the series. Official sites' "
-                        "results are read directly; other results need the Ollama server above."),
+        SettingDef("web_search", "Web search", default="auto",
+                   options=[("auto", "Unless an official site has a number"), ("always", "Always"), ("off", "Off")],
+                   help="Search DuckDuckGo for the series, also when only MangaUpdates or English sites have a "
+                        "number (MangaUpdates can be wrong). Its number comes before MangaUpdates'. Official "
+                        "sites' results are read directly; other results need the Ollama server above."),
     ]
 
     def __init__(self):
@@ -185,8 +200,11 @@ class OfficialChapters(Plugin):
             return self.progress
         last = ctx.settings.get("last_run")
         ai = "with Ollama" if ctx.setting("ollama_url") else "without Ollama (only sites it has a parser for)"
-        if ctx.setting("web_search") != "off":
-            ai += ", and searches the web when the links give no number"
+        mode = web_mode(ctx)
+        if mode == "always":
+            ai += ", and searches the web for every series"
+        elif mode == "auto":
+            ai += ", and searches the web when no official site has a number"
         return f"Last check of all series: {last}. Reads pages {ai}." if last else f"Reads pages {ai}."
 
     def _check_all(self, ctx):
@@ -222,9 +240,10 @@ class OfficialChapters(Plugin):
 
     def find(self, ctx, series):
         """(headline, every source asked). Every original-language site and MangaUpdates are always
-        asked, so they can be compared; English sites only when those gave no number.
-        The headline is the highest original-language number (a site can lag behind the others),
-        else MangaUpdates, else the highest English one, else a web search (unless it's turned off)."""
+        asked, so they can be compared. The web search runs when no original-language site has a
+        number (or always, or never: the Web search setting). English sites only when nothing else
+        gave a number. The headline is the highest of the original-language sites and the web search
+        (a site can lag behind the others), else MangaUpdates, else the highest English one."""
         links = ctx.db.query(Link).filter_by(series_id=series.id).all()
         by_tier = {0: [], 2: []}
         for link in links:
@@ -244,18 +263,20 @@ class OfficialChapters(Plugin):
             rows.append(mu)
         else:
             mu = None
-        best = max((r for r in original if r["chapters"]), key=lambda r: r["chapters"], default=None)
+        first = list(original)  # the headline comes from these, the highest; else MangaUpdates; else English
+        mode = web_mode(ctx)
+        if mode == "always" or (mode == "auto" and not any(r["chapters"] for r in original)):
+            n, url = self.from_web_search(ctx, series)
+            web = {"source": "Web search", "url": url, "chapters": n}
+            rows.append(web)
+            first.append(web)  # before MangaUpdates, whose count can be wrong
+        best = max((r for r in first if r["chapters"]), key=lambda r: r["chapters"], default=None)
         if best is None and mu and mu["chapters"]:
             best = mu
         if best is None:
             english = [ask(link) for link in by_tier[2]]
             rows += english
             best = max((r for r in english if r["chapters"]), key=lambda r: r["chapters"], default=None)
-        if best is None and ctx.setting("web_search") != "off":
-            n, url = self.from_web_search(ctx, series)
-            web = {"source": "Web search", "url": url, "chapters": n}
-            rows.append(web)
-            best = web if n else None
         return best, rows
 
     # ------------------------------------------------------------------ sources
@@ -354,7 +375,7 @@ class OfficialChapters(Plugin):
         results, seen = [], set()
         for q in queries:
             for r in self._search(ctx, q):
-                if r["url"] not in seen:
+                if r["url"] not in seen and not is_store(r["url"]):
                     seen.add(r["url"])
                     results.append(r)
         results = results[:MAX_RESULTS]
@@ -392,7 +413,8 @@ class OfficialChapters(Plugin):
             "Only use results about this exact manga. Ignore results about its anime (episode counts), "
             "light novel, a different series with a similar name, volume counts, and English release counts "
             "if the original is further along. Ignore extras, specials and side stories. Ignore spoiler and "
-            "prediction pages (ネタバレ, 予想, raw), which name chapters that aren't out yet.\n"
+            "prediction pages (ネタバレ, 予想, raw), which name chapters that aren't out yet. Ignore e-book "
+            "stores' episode counts (配信話数, 全N話 on a store), which cut volumes into smaller paid parts.\n"
             "Prefer official sites and MangaUpdates. If the results disagree, take the highest number a "
             "reliable result shows. If no result shows it, answer null. Do not guess.\n"
             "Answer only with JSON: "
@@ -407,7 +429,8 @@ class OfficialChapters(Plugin):
             return None, None
         named = [results[i - 1]] if isinstance(i, int) and 1 <= i <= len(results) else []
         for r in named + results:
-            if n in chapter_numbers([seen(r)]):
+            # a store's "配信話数 全172話" (parts on sale) isn't a chapter label
+            if n in chapter_numbers([re.sub(r"配信話数\s*全?\s*\d+\s*話", " ", seen(r))]):
                 return n, r["url"]
         ctx.log.info("Official chapters: the model said %s for %s, but no search result shows it", n, titles[0])
         return None, None
@@ -451,6 +474,12 @@ class OfficialChapters(Plugin):
             ctx.log.warning("Official chapters: Ollama failed (%s)", e)
             return None
         return answer if isinstance(answer, dict) else None
+
+
+def web_mode(ctx):
+    """"auto", "always" or "off". Version 0.3.0 saved "on" (only when nothing had a number): now "auto"."""
+    mode = ctx.setting("web_search")
+    return mode if mode in ("always", "off") else "auto"
 
 
 def search_results(raw):

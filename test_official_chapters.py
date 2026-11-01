@@ -182,8 +182,8 @@ def test_mangaupdates_before_english(client, web):
     web.pages["https://global.manga-up.com/manga/24"] = (200, MANGA_UP)
     set_links(web.sid, [("Manga UP!", "https://global.manga-up.com/manga/24")],
               chapters_total=None, mangaupdates_id="luo8m60")  # base-36 id from a MangaUpdates URL
-    check(client, web.sid)
-    assert field(client, web.sid) == "MangaUpdates: 130"
+    check(client, web.sid)  # no official site: the web search runs too (it finds nothing here)
+    assert field(client, web.sid) == "MangaUpdates: 130\nWeb search: no chapter number found"
 
 
 def test_english_site_last(client, web):
@@ -193,7 +193,8 @@ def test_english_site_last(client, web):
                         ("Manga UP!", "https://global.manga-up.com/manga/24")],
               chapters_total=44, mangaupdates_id=None)
     check(client, web.sid)
-    assert field(client, web.sid) == "Manga UP!: 44\nMANGA Plus: no chapter number found"
+    assert field(client, web.sid) == ("Manga UP!: 44\nWeb search: no chapter number found\n"
+                                      "MANGA Plus: no chapter number found")
 
 
 def test_ai_reads_other_pages(client, web):
@@ -228,7 +229,7 @@ def test_chapter_labels_on_the_page_before_ai(client, web):
               chapters_total=None)
     web.ai_answer = 26  # a wrong reading that is on the page: never asked
     check(client, web.sid)
-    assert field(client, web.sid) == "Omoi: 47"
+    assert field(client, web.sid) == "Omoi: 47\nWeb search: no chapter number found"
     assert not any(u.endswith("/api/chat") for u in web.asked)
 
 
@@ -327,6 +328,65 @@ def test_no_web_search_when_the_links_have_a_number_or_its_off(client, web):
     no_links(web)
     assert "No official chapter count" in check(client, web.sid)["message"]
     assert not web.searches
+
+
+MU_199 = json.dumps({"status": "20 Volumes (Ongoing)\n199 Chapters"})
+JUMP_250 = [("[第250話]ダンダダン | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/250", "")]
+
+
+def test_web_search_checks_mangaupdates(client, web):
+    web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (200, MU_199)
+    set_links(web.sid, [], mangaupdates_id="47567127096", title_native="ダンダダン", title_english="Series B")
+    web.search_results = JUMP_250
+    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]
+    assert field(client, web.sid) == "Web search: 250\nMangaUpdates: 199"
+
+    web.search_results = [("[第190話]ダンダダン | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/190", "")]
+    assert "chapter 190 (Web search)" in check(client, web.sid)["message"]  # before MangaUpdates, even if lower
+
+    web.search_results = []  # nothing found: MangaUpdates
+    assert "chapter 199 (MangaUpdates)" in check(client, web.sid)["message"]
+
+
+def test_web_search_always_or_off(client, web):
+    web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li>")
+    web.pages["https://api.mangaupdates.com/v1/series/47567127096"] = (200, MU_199)
+    set_links(web.sid, [("Piccoma", "https://piccoma.com/web/product/9")], mangaupdates_id="47567127096",
+              title_native="ダンダダン", title_english="Series B")
+    web.search_results = JUMP_250
+    settings(web_search="always")
+    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]  # the highest of site and search
+    assert field(client, web.sid) == "Web search: 250\nMangaUpdates: 199\nPiccoma: 198"
+
+    web.searches.clear()
+    settings(web_search="off")
+    set_links(web.sid, [], mangaupdates_id="47567127096")
+    assert "chapter 199 (MangaUpdates)" in check(client, web.sid)["message"]
+    assert not web.searches
+
+    settings(web_search="on")  # saved by version 0.3.0: now the default
+    check(client, web.sid)
+    assert web.searches
+
+
+def test_store_episode_counts_arent_chapters(client, web):
+    m = import_plugin()
+    assert m.tier("https://mechacomic.jp/books/87286") is None  # not read as a link either
+    assert m.tier("https://sp.handycomic.jp/product/1") is None
+    assert m.newest(["Chapters: 48"]) == 48
+    settings(ollama_url="pc:11434")
+    set_links(web.sid, [], mangaupdates_id=None, title_native="シックス ハーフ", title_english="Series B")
+    web.search_results = [  # what DuckDuckGo found for SIX HALF
+        ("【2話無料】シックス ハーフ | 漫画なら、めちゃコミック", "https://mechacomic.jp/books/87286",
+         "配信話数 全172話完結 配信巻数 全11巻完結"),
+        ("シックス ハーフ | ギャラコミ", "https://galcomi.jp/sd/page/title/1", "配信話数 全172話完結"),
+        ("Six Half - Manga | Kenmei", "https://www.kenmei.co/series/six-half", "Status: Finished Chapters: 48"),
+    ]
+    web.ai_answer, web.ai_result = 172, 1
+    assert "No official chapter count" in check(client, web.sid)["message"]
+    assert "mechacomic" not in web.prompts[-1]  # the store isn't even shown to the model
+    web.ai_answer, web.ai_result = 48, 2
+    assert "chapter 48 (Web search)" in check(client, web.sid)["message"]
 
 
 def test_search_refused(client, web):
