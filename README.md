@@ -17,7 +17,7 @@ The result shows under the series' **Details**:
 ```
 Official sources    Shonen Jump+: 201
                     MangaUpdates: 199
-                    Piccoma: 198
+                    Comic Days: 198
                     ComicWalker: no chapter number found
 ```
 
@@ -35,8 +35,8 @@ It uses the links the series already has (from AniList and MangaUpdates):
    number, since they have only the translated chapters.
 
 **Official sources** lists every source asked and its number, so you can compare them (one site can
-be behind the others). The button's message names the highest number from the original-language
-sites and the web search, else MangaUpdates', else the highest English one.
+be behind the others). The button's message names the highest original-language site's number;
+else the number most web search sites and MangaUpdates agree on; else the highest English one.
 
 How each page is read:
 
@@ -52,7 +52,9 @@ Extras, specials, previews and announcements without a number are left out. `Cha
 counts as chapter 44, and a range like `Chapters 44-47` (a store's volume) as 47.
 
 Shops that only list volumes (Yen Press, Kodansha US, Seven Seas...) and sites in other languages
-(e.g. French) are skipped.
+(e.g. French) are skipped. So are Japanese e-book stores that cut chapters or volumes into smaller
+paid parts and number those (Piccoma, Mecha Comic, Comic Cmoa, BookLive, ebookjapan...): Piccoma's
+39 episodes of あした死ぬには、 are about 23 chapters.
 
 ## Ollama (optional)
 
@@ -74,21 +76,31 @@ plain HTML page: free, no account or key). That includes series where only Manga
 since MangaUpdates can be wrong. It searches for the Japanese title with 漫画 最新話 ("manga, newest
 chapter") and for the English title with "manga latest chapter".
 
-- **With an Ollama server set**, your model reads the results. It's told to ignore anime episodes,
-  light novels, spoiler pages and series with similar names. Its number is only used if a result
-  shows it as a chapter label (`第250話`, `Chapter 250`), so a made-up number or an anime season
-  is never shown.
-- **Without one** (or if the model has no answer), the plugin reads the titles of results from the
-  official sites, e.g. `[第250話]ダンダダン | 少年ジャンプ＋`.
+- **With an Ollama server set**, your model reads the results and lists every site that gives a
+  chapter count. It's told to ignore anime episodes, light novels, spoiler pages and series with
+  similar names. Each number is only used if its own result shows it as a chapter label
+  (`第250話`, `Chapter 250`, `Chapters: 48`), so a made-up number or an anime season is never shown.
+- The plugin also reads the titles of results from the official sites, e.g.
+  `[第250話]ダンダダン | 少年ジャンプ＋` (the only thing it reads without a model).
 
-The result shows as `Web search: 250` under **Official sources**, next to MangaUpdates' count to
-compare. The button names the web search's number before MangaUpdates', even if it's lower.
+Every site it found gets its own line under **Official sources**, next to MangaUpdates' count:
+
+```
+Official sources    charagoo.jp (web search): 250
+                    comicy.jp (web search): 250
+                    shonenjumpplus.com (web search): 250
+                    anidokonavi.com (web search): 247
+                    MangaUpdates: 245
+```
+
+No single site is believed on its own: the button names the number most of these sites and
+MangaUpdates agree on, here "chapter 250 (3 of 5 sources agree)". If it's a tie, the highest wins.
 
 The **Web search** setting has three choices:
 
 - **Unless an official site has a number** (the default): as above.
-- **Always**: for every series, also those an official site has a number for. The highest number
-  of the sites and the search is named.
+- **Always**: for every series, also those an official site has a number for. The highest of the
+  official sites' numbers and the web sites' agreed number is named.
 - **Off**.
 
 DuckDuckGo sometimes asks automated searches to prove they're human. The plugin doesn't try to get

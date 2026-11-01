@@ -30,6 +30,7 @@ import html
 import json
 import re
 import unicodedata
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -45,11 +46,12 @@ WEB_SEARCH = "https://html.duckduckgo.com/html/"
 PAGE_TEXT = 15000   # characters of a page's text the model gets
 RESULT_TEXT = 1000  # characters of each search result the model gets (DuckDuckGo's snippets are shorter)
 MAX_RESULTS = 15
+MAX_WEB_SOURCES = 6  # sites from a web search listed under Official sources
 AI_WAIT = 180       # seconds to wait for the model's answer
 
 # Original-language sites that aren't on a .jp domain.
 ORIGINAL_HOSTS = {
-    "comic.pixiv.net", "piccoma.com", "comic-days.com", "comic-walker.com", "comic-fuz.com",
+    "comic.pixiv.net", "comic-days.com", "comic-walker.com", "comic-fuz.com",
     "magcomi.com", "comic-action.com", "kuragebunch.com", "comic-zenon.com", "comic-gardo.com",
     "comic-trail.com", "comic-earthstar.com", "comic-growl.com", "comicborder.com", "comic-ogyaaa.com",
     "shonenjumpplus.com", "pocket.shonenmagazine.com", "manga-park.com", "beltoon.jp",
@@ -71,10 +73,10 @@ SKIP_HOSTS = {
     "kodansha.co.jp", "anilist.co", "myanimelist.net", "mangaupdates.com", "twitter.com", "x.com",
 }
 # Japanese e-book stores that cut each volume into small paid parts and number those: "全172話" on
-# Mecha Comic is SIX HALF's 11 volumes, not its chapters. Skipped as links and in search results.
-# Subdomains count too (sp.handycomic.jp).
+# Mecha Comic is SIX HALF's 11 volumes, not its chapters; Piccoma's "39話" for あした死ぬには、 is
+# about 23 chapters. Skipped as links and in search results. Subdomains count too (sp.handycomic.jp).
 STORE_HOSTS = {
-    "mechacomic.jp", "cmoa.jp", "booklive.jp", "ebookjapan.yahoo.co.jp", "renta.papy.co.jp",
+    "piccoma.com", "mechacomic.jp", "cmoa.jp", "booklive.jp", "ebookjapan.yahoo.co.jp", "renta.papy.co.jp",
     "manga.line.me", "handycomic.jp", "k-manga.jp", "book.dmm.com",
 }
 
@@ -150,7 +152,7 @@ def page_text(raw):
 class OfficialChapters(Plugin):
     id = "official-chapters"
     name = "Official chapters"
-    version = "0.4.0"
+    version = "0.5.0"
     description = "Finds the newest chapter on the series' official sites (Japanese first) and shows it next to AniList's count."
     repo = "ivokolarov0/manga-vibe-ext-official-chapters"
     permissions = [
@@ -169,8 +171,9 @@ class OfficialChapters(Plugin):
         SettingDef("web_search", "Web search", default="auto",
                    options=[("auto", "Unless an official site has a number"), ("always", "Always"), ("off", "Off")],
                    help="Search DuckDuckGo for the series, also when only MangaUpdates or English sites have a "
-                        "number (MangaUpdates can be wrong). Its number comes before MangaUpdates'. Official "
-                        "sites' results are read directly; other results need the Ollama server above."),
+                        "number (MangaUpdates can be wrong). Every site it finds is listed, and the number most "
+                        "of them and MangaUpdates agree on is named. Official sites' results are read "
+                        "directly; other results need the Ollama server above."),
     ]
 
     def __init__(self):
@@ -241,9 +244,10 @@ class OfficialChapters(Plugin):
     def find(self, ctx, series):
         """(headline, every source asked). Every original-language site and MangaUpdates are always
         asked, so they can be compared. The web search runs when no original-language site has a
-        number (or always, or never: the Web search setting). English sites only when nothing else
-        gave a number. The headline is the highest of the original-language sites and the web search
-        (a site can lag behind the others), else MangaUpdates, else the highest English one."""
+        number (or always, or never: the Web search setting); each site it finds is listed. English
+        sites only when nothing else gave a number. The headline is the highest original-language
+        site (a site can lag behind the others); else the number most web sources and MangaUpdates
+        agree on (a tie: the highest); else the highest English one."""
         links = ctx.db.query(Link).filter_by(series_id=series.id).all()
         by_tier = {0: [], 2: []}
         for link in links:
@@ -263,16 +267,18 @@ class OfficialChapters(Plugin):
             rows.append(mu)
         else:
             mu = None
-        first = list(original)  # the headline comes from these, the highest; else MangaUpdates; else English
         mode = web_mode(ctx)
+        web = []
         if mode == "always" or (mode == "auto" and not any(r["chapters"] for r in original)):
-            n, url = self.from_web_search(ctx, series)
-            web = {"source": "Web search", "url": url, "chapters": n}
-            rows.append(web)
-            first.append(web)  # before MangaUpdates, whose count can be wrong
-        best = max((r for r in first if r["chapters"]), key=lambda r: r["chapters"], default=None)
-        if best is None and mu and mu["chapters"]:
-            best = mu
+            web = [{"source": f"{_host(url)} (web search)", "url": url, "chapters": n}
+                   for n, url in self.from_web_search(ctx, series)]
+            rows += web or [{"source": "Web search", "url": None, "chapters": None}]
+        if any(r["chapters"] for r in original):
+            # the highest official site (one can lag behind the others), or the web's agreed number
+            best = max((r for r in original + [vote(web)] if r and r["chapters"]), key=lambda r: r["chapters"])
+        else:
+            # no official site: the number most web sources and MangaUpdates agree on
+            best = vote(web + ([mu] if mu else []))
         if best is None:
             english = [ask(link) for link in by_tier[2]]
             rows += english
@@ -361,10 +367,9 @@ class OfficialChapters(Plugin):
 
     # ------------------------------------------------------------------ web search
     def from_web_search(self, ctx, series):
-        """(newest chapter, the result's URL) from a DuckDuckGo search; (None, None) if nothing reliable
-        was found. Results from official original-language sites whose title names the series are read
-        like a page ("[第250話]ダンダダン | 少年ジャンプ＋"); otherwise the model reads all results, and
-        its number must be in the result it points to."""
+        """[(chapter, URL)], one per site, from a DuckDuckGo search: [] if nothing reliable was found.
+        The model reads every result, and each number must be a chapter label in its own result.
+        Official sites' result titles that name the series are read too ("[第250話]ダンダダン | 少年ジャンプ＋")."""
         titles = [t for t in (series.title_native, series.title_english, series.title_romaji) if t]
         if not titles:
             titles = [series.folder_name]
@@ -380,60 +385,70 @@ class OfficialChapters(Plugin):
                     results.append(r)
         results = results[:MAX_RESULTS]
         if not results:
-            return None, None
+            return []
 
-        n, url = self._read_results(ctx, titles, results)
-        if n:
-            return n, url
-        # no model, or no answer from it: the official sites' own result titles
+        found = self._read_results(ctx, titles, results)
         names = [unicodedata.normalize("NFKC", t).casefold() for t in titles]
-        official = []
         for r in results:
             title = unicodedata.normalize("NFKC", r["title"]).casefold()
             # only the known official sites: other .jp pages include spoiler blogs ("第251話ネタバレ")
             n = newest([r["title"]]) if _host(r["url"]) in ORIGINAL_HOSTS and any(t in title for t in names) else None
             if n:
-                official.append((n, r["url"]))
-        return max(official) if official else (None, None)
+                found.append((n, r["url"]))
+        by_site = {}  # one number per site, its highest (Jump+ shows chapter 219 and 250)
+        for n, url in found:
+            if n > by_site.get(_host(url), (0, None))[0]:
+                by_site[_host(url)] = (n, url)
+        return sorted(by_site.values(), reverse=True)[:MAX_WEB_SOURCES]
 
     def _read_results(self, ctx, titles, results):
-        """(chapter, URL) the model reads from the search results, or (None, None). Its number must be
-        a chapter label (第250話, Chapter 250) in the result it names, or else in another result: a bare
-        number could be an anime season or a date."""
-        def seen(r):  # what the model gets of a result
-            return f"{r['title']} {r['content'][:RESULT_TEXT]}"
+        """[(chapter, URL)] the model reads from the search results, one per result that shows this
+        manga's chapter count. Each number must be a chapter label (第250話, Chapter 250) in the result
+        the model names: a bare number could be an anime season or a date. If the model names a wrong
+        result (it once gave the chapter as the result's number), another result with that label counts."""
+        def labels(r):  # chapter labels in what the model gets of a result
+            seen = f"{r['title']} {r['content'][:RESULT_TEXT]}"
+            # a store's "配信話数 全172話" (parts on sale) isn't a chapter label
+            return chapter_numbers([re.sub(r"配信話数\s*全?\s*\d+\s*話", " ", seen)])
 
         listing = "\n\n".join(f"RESULT {i}: {r['title']}\nURL: {r['url']}\n{r['content'][:RESULT_TEXT]}"
                               for i, r in enumerate(results, 1))
         names = " / ".join(f'"{t}"' for t in titles)
         prompt = (
             f"These are web search results about the manga (Japanese comic) {names}.\n"
-            "What is the number of the newest regular chapter of this manga released so far in its original "
-            "language (Japanese, Korean or Chinese)?\n"
+            "For each result that shows it: what is the number of the newest regular chapter of this manga "
+            "released so far in its original language (Japanese, Korean or Chinese), or its total number "
+            "of chapters if it has ended?\n"
             "Only use results about this exact manga. Ignore results about its anime (episode counts), "
             "light novel, a different series with a similar name, volume counts, and English release counts "
             "if the original is further along. Ignore extras, specials and side stories. Ignore spoiler and "
             "prediction pages (ネタバレ, 予想, raw), which name chapters that aren't out yet. Ignore e-book "
             "stores' episode counts (配信話数, 全N話 on a store), which cut volumes into smaller paid parts.\n"
-            "Prefer official sites and MangaUpdates. If the results disagree, take the highest number a "
-            "reliable result shows. If no result shows it, answer null. Do not guess.\n"
+            "List every result that shows it, each with its own number; leave out the others. If no "
+            "result shows it, answer with an empty list. Do not guess.\n"
             "Answer only with JSON: "
-            '{"last_chapter": <the chapter number, or null>, '
-            f'"result_number": <which RESULT shows it, from 1 to {len(results)} (the number after the word '
-            'RESULT, not the chapter number), or null>}\n\n' + listing
+            '{"sources": [{"result_number": <which RESULT, from 1 to ' + str(len(results)) + ' (the number '
+            'after the word RESULT, not the chapter number)>, "last_chapter": <the chapter number>}, ...]}\n\n'
+            + listing
         )
-        answer = self._ask_model(ctx, prompt, {"last_chapter": {"type": ["integer", "null"]},
-                                               "result_number": {"type": ["integer", "null"]}})
-        n, i = (answer.get("last_chapter"), answer.get("result_number")) if answer else (None, None)
-        if not isinstance(n, int) or n <= 0:
-            return None, None
-        named = [results[i - 1]] if isinstance(i, int) and 1 <= i <= len(results) else []
-        for r in named + results:
-            # a store's "配信話数 全172話" (parts on sale) isn't a chapter label
-            if n in chapter_numbers([re.sub(r"配信話数\s*全?\s*\d+\s*話", " ", seen(r))]):
-                return n, r["url"]
-        ctx.log.info("Official chapters: the model said %s for %s, but no search result shows it", n, titles[0])
-        return None, None
+        item = {"type": "object", "properties": {"result_number": {"type": "integer"},
+                                                 "last_chapter": {"type": "integer"}},
+                "required": ["result_number", "last_chapter"]}
+        answer = self._ask_model(ctx, prompt, {"sources": {"type": "array", "items": item}})
+        sources = answer.get("sources") if answer else None
+        found = []
+        for s in sources if isinstance(sources, list) else []:
+            n, i = (s.get("last_chapter"), s.get("result_number")) if isinstance(s, dict) else (None, None)
+            if not isinstance(n, int) or n <= 0:
+                continue
+            named = [results[i - 1]] if isinstance(i, int) and 1 <= i <= len(results) else []
+            r = next((r for r in named + results if n in labels(r)), None)
+            if r:
+                found.append((n, r["url"]))
+            else:
+                ctx.log.info("Official chapters: the model said %s for %s, but no search result shows it",
+                             n, titles[0])
+        return found
 
     @staticmethod
     def _search(ctx, query):
@@ -474,6 +489,21 @@ class OfficialChapters(Plugin):
             ctx.log.warning("Official chapters: Ollama failed (%s)", e)
             return None
         return answer if isinstance(answer, dict) else None
+
+
+def vote(rows):
+    """The number most of the rows agree on (a tie: the highest), as a headline row; None if none has one."""
+    rows = [r for r in rows if r and r["chapters"]]
+    if not rows:
+        return None
+    counts = Counter(r["chapters"] for r in rows)
+    n = max(counts, key=lambda c: (counts[c], c))
+    first = next(r for r in rows if r["chapters"] == n)
+    if len(rows) == 1:
+        return first
+    agree = (f"{counts[n]} of {len(rows)} sources agree" if counts[n] > 1
+             else f"{len(rows)} sources disagree, the highest")
+    return {"source": agree, "url": first["url"], "chapters": n}
 
 
 def web_mode(ctx):
