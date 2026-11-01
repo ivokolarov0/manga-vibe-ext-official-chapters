@@ -15,12 +15,13 @@ It only runs when you press a button:
 The result shows under the series' **Details**:
 
 ```
-Official chapters   201 (Shonen Jump+) · AniList says 210
-Official sources    Piccoma: 198
-                    Shonen Jump+: 201
-                    ComicWalker: no chapter number found
+Official sources    Shonen Jump+: 201
                     MangaUpdates: 199
+                    Piccoma: 198
+                    ComicWalker: no chapter number found
 ```
+
+The highest number comes first. AniList's own count stays under **Length**, to compare.
 
 ## Where it looks
 
@@ -31,9 +32,9 @@ It uses the links the series already has (from AniList and MangaUpdates):
 3. **English sites** (MANGA Plus, Manga UP!, K MANGA, VIZ, Omoi...): only when 1 and 2 gave no
    number, since they have only the translated chapters.
 
-**Official sources** lists every source asked and its number, so you can compare them.
-**Official chapters** is the highest original-language number (one site can be behind the others),
-else MangaUpdates', else the highest English one.
+**Official sources** lists every source asked and its number, so you can compare them (one site can
+be behind the others). The button's message names the highest original-language number, else
+MangaUpdates', else the highest English one.
 
 How each page is read:
 

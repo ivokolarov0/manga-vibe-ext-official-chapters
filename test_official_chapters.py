@@ -61,9 +61,14 @@ def set_links(sid, urls, **values):
         db.commit()
 
 
-def field(client, sid):
+def fields(client, sid):
     s = client.get(f"/api/series/{sid}").json()
-    return next((f["value"] for f in s["plugin_fields"] if f["plugin"] == PID and f["key"] == "official_chapters"), None)
+    return {f["key"]: f["value"] for f in s["plugin_fields"] if f["plugin"] == PID}
+
+
+def field(client, sid):
+    """The Official sources list, one line per source."""
+    return fields(client, sid).get("official_sources")
 
 
 def check(client, sid):
@@ -120,12 +125,13 @@ def test_site_order():
 
 # ---------------------------------------------------------------- whole check
 
-def field_of(client, sid, key):
-    s = client.get(f"/api/series/{sid}").json()
-    return next((f["value"] for f in s["plugin_fields"] if f["plugin"] == PID and f["key"] == key), None)
-
-
 def test_every_japanese_site_and_mangaupdates(client, web):
+    from app.db import SessionLocal
+    from app.models import Series
+    from app.plugins import Context, manager
+    with SessionLocal() as db:  # version 0.1's separate line, which a check removes
+        Context(manager.get(PID), db).set_field(db.get(Series, web.sid), "official_chapters", "47 (Omoi)")
+        db.commit()
     web.pages["https://shonenjumpplus.com/episode/1"] = (200, JUMP_PAGE)
     web.pages["https://shonenjumpplus.com/rss/series/123"] = (200, JUMP_RSS)
     web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li><li>第197話</li>")
@@ -140,9 +146,8 @@ def test_every_japanese_site_and_mangaupdates(client, web):
               chapters_total=210, mangaupdates_id="47567127096")
     msg = check(client, web.sid)["message"]
     assert "chapter 201" in msg and "3 more sources" in msg
-    assert field_of(client, web.sid, "official_chapters") == "201 (Shonen Jump+) · AniList says 210"
-    assert field_of(client, web.sid, "official_sources").split("\n") == [
-        "Piccoma: 198", "Shonen Jump+: 201", "ComicWalker: no chapter number found", "MangaUpdates: 199"]
+    assert fields(client, web.sid) == {"official_sources": "\n".join([  # one list, the highest first
+        "Shonen Jump+: 201", "MangaUpdates: 199", "Piccoma: 198", "ComicWalker: no chapter number found"])}
     assert not any("manga-up" in u for u in web.asked)  # English only when nothing else had a number
 
 
@@ -153,7 +158,7 @@ def test_mangaupdates_before_english(client, web):
     set_links(web.sid, [("Manga UP!", "https://global.manga-up.com/manga/24")],
               chapters_total=None, mangaupdates_id="luo8m60")  # base-36 id from a MangaUpdates URL
     check(client, web.sid)
-    assert field(client, web.sid) == "130 (MangaUpdates)"
+    assert field(client, web.sid) == "MangaUpdates: 130"
 
 
 def test_english_site_last(client, web):
@@ -163,7 +168,7 @@ def test_english_site_last(client, web):
                         ("Manga UP!", "https://global.manga-up.com/manga/24")],
               chapters_total=44, mangaupdates_id=None)
     check(client, web.sid)
-    assert field(client, web.sid) == "44 (Manga UP!)"  # same as AniList: nothing more to say
+    assert field(client, web.sid) == "Manga UP!: 44\nMANGA Plus: no chapter number found"
 
 
 def test_ai_reads_other_pages(client, web):
@@ -177,7 +182,7 @@ def test_ai_reads_other_pages(client, web):
     set_links(web.sid, [("ComicWalker", "https://comic-walker.com/detail/1")], mangaupdates_id=None)
     web.ai_answer = 12
     check(client, web.sid)
-    assert field(client, web.sid).startswith("12 (ComicWalker)")
+    assert field(client, web.sid) == "ComicWalker: 12"
     assert "http://pc:11434/api/chat" in web.asked
 
     web.ai_answer = 99  # made up: not on the page
@@ -198,7 +203,7 @@ def test_chapter_labels_on_the_page_before_ai(client, web):
               chapters_total=None)
     web.ai_answer = 26  # a wrong reading that is on the page: never asked
     check(client, web.sid)
-    assert field(client, web.sid) == "47 (Omoi)"
+    assert field(client, web.sid) == "Omoi: 47"
     assert not any(u.endswith("/api/chat") for u in web.asked)
 
 

@@ -2,15 +2,14 @@
 
 AniList's chapter count is often wrong (it counts extras, or lags behind). This plugin looks at the
 official links the series already has (from AniList and MangaUpdates) and finds the newest regular
-chapter there. It never changes AniList's number; it adds an "Official chapters" line to the series.
+chapter there. It never changes AniList's number; it adds an "Official sources" list to the series:
+each source and its number, the highest first, to compare.
 
 Where it looks:
 1. Every site in the original language (Japanese, Korean, Chinese): they have every chapter that is out.
 2. MangaUpdates: the original edition's count, e.g. "120 Chapters (Ongoing)". Always asked too.
 3. English sites (MANGA Plus, Manga UP!, K MANGA, VIZ...): only when 1 and 2 gave no number, since
    they have only the translated chapters.
-"Official sources" lists each source and its number, to compare. "Official chapters" is the highest
-original-language number, else MangaUpdates', else the highest English one.
 
 How a page is read:
 - Sites built on GigaViewer (Shonen Jump+, Comic Days, Magazine Pocket...) have an RSS feed per series.
@@ -33,8 +32,8 @@ import httpx
 from app.models import Link, Series
 from app.plugins import Action, FieldDef, Plugin, SettingDef
 
-FIELD = "official_chapters"
 SOURCES = "official_sources"  # every source asked and its number, one per line, to compare
+OLD_FIELD = "official_chapters"  # version 0.1 showed the highest number on a line of its own
 MU_API = "https://api.mangaupdates.com/v1/series/"
 PAGE_TEXT = 15000   # characters of a page's text the model gets
 AI_WAIT = 180       # seconds to wait for the model's answer
@@ -114,6 +113,12 @@ def mu_chapters(status_text):
     return max(nums) if nums else None
 
 
+def sources_text(rows):
+    """One line per source, the highest number first: "Omoi: 47", "MangaUpdates: no chapter number found"."""
+    rows = sorted(rows, key=lambda r: -(r["chapters"] or 0))  # stable: equal numbers keep their order
+    return "\n".join(f"{r['source']}: {r['chapters'] or 'no chapter number found'}" for r in rows) or None
+
+
 def page_text(raw):
     """A page's visible text, short enough for a model."""
     raw = re.sub(r"(?is)<(script|style|noscript|svg)\b.*?</\1>", " ", raw)
@@ -124,7 +129,7 @@ def page_text(raw):
 class OfficialChapters(Plugin):
     id = "official-chapters"
     name = "Official chapters"
-    version = "0.1.0"
+    version = "0.2.0"
     description = "Finds the newest chapter on the series' official sites (Japanese first) and shows it next to AniList's count."
     repo = "ivokolarov0/manga-vibe-ext-official-chapters"
     permissions = [
@@ -132,7 +137,7 @@ class OfficialChapters(Plugin):
         "Connects to api.mangaupdates.com",
         "Sends page text to your Ollama server (only if one is set)",
     ]
-    fields = [FieldDef(FIELD, "Official chapters"), FieldDef(SOURCES, "Official sources")]
+    fields = [FieldDef(SOURCES, "Official sources")]
     actions = [Action("check", "Check official chapters")]
     global_actions = [Action("check_all", "Check all series")]
     settings_fields = [
@@ -197,14 +202,8 @@ class OfficialChapters(Plugin):
         best, rows = self.find(ctx, series)
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         ctx.set_series_data(series, "last", {"best": best, "sources": rows, "checked": stamp})
-        ctx.set_field(series, SOURCES, "\n".join(
-            f"{r['source']}: {r['chapters'] if r['chapters'] else 'no chapter number found'}" for r in rows) or None)
-        text = None
-        if best:
-            text = f"{best['chapters']} ({best['source']})"
-            if series.chapters_total and series.chapters_total != best["chapters"]:
-                text += f" · AniList says {series.chapters_total}"
-        ctx.set_field(series, FIELD, text)  # None: nothing found now, so an old number doesn't stay
+        ctx.set_field(series, SOURCES, sources_text(rows))
+        ctx.set_field(series, OLD_FIELD, None)  # version 0.1's separate headline line
         return best
 
     def find(self, ctx, series):
