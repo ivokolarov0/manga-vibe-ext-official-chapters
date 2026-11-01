@@ -279,7 +279,7 @@ def test_official_result_titles_are_read_without_a_model(client, web):
     msg = check(client, web.sid)["message"]
     assert "chapter 250 (shonenjumpplus.com (web search))" in msg
     assert field(client, web.sid) == "shonenjumpplus.com (web search): 250"  # one line per site, its highest
-    assert web.searches[0] == "ダンダダン 漫画 最新話" and "Series B manga latest chapter" in web.searches
+    assert web.searches == ["ダンダダン 漫画 最新話", '"Series B" manga how many chapters']
 
 
 def test_the_model_reads_other_results(client, web):
@@ -330,6 +330,37 @@ def test_every_web_source_is_listed_and_the_most_agreed_number_named(client, web
     web.ai_sources = [{"result_number": 1, "last_chapter": 44}, {"result_number": 2, "last_chapter": 48}]
     web.search_results = SIX_HALF[:2]
     assert "chapter 44 (2 of 3 sources agree)" in check(client, web.sid)["message"]  # MangaUpdates and Niadd
+
+
+MAL_PAGE = ('<title>Ashita Shinu ni wa, (Since I Could Die Tomorrow,) | Manga - MyAnimeList.net</title>'
+            '<div><span class="dark_text">Volumes:</span> 4</div>'
+            '<div class="spaceit_pad"><span class="dark_text">Chapters:</span>\n  21\n</div>')
+
+
+def test_myanimelist_page_and_every_site_listed(client, web):
+    m = import_plugin()
+    assert m.newest(["Chapters : 16"]) == 16 and m.newest(["About Chapters (47) Reviews"]) == 47
+    settings(ollama_url="pc:11434")
+    set_links(web.sid, [], mangaupdates_id=None, title_native="あした死ぬには、", title_english="Series B",
+              title_romaji="Ashita Shinu ni wa,")
+    web.pages["https://myanimelist.net/manga/124022/Ashita_Shinu_ni_wa"] = (200, MAL_PAGE)
+    web.search_results = [  # what DuckDuckGo found: MyAnimeList's snippet has no count
+        ("Ashita Shinu ni wa, | MyAnimeList", "https://myanimelist.net/manga/124022/Ashita_Shinu_ni_wa",
+         "Background Ashita Shinu ni wa, ranked third in the 2020 Kono Manga ga Sugoi!"),
+        ("Ashita Shinu ni wa, - Kenmei", "https://www.kenmei.co/series/ashita", "Status: Releasing Chapters : 16"),
+        ("Since I Could Die Tomorrow - Wikipedia", "https://en.wikipedia.org/wiki/Since_I_Could_Die_Tomorrow",
+         "Chapters 17–21"),
+    ]
+    web.ai_sources = [{"result_number": 2, "last_chapter": 16}, {"result_number": 3, "last_chapter": 21}]
+    msg = check(client, web.sid)["message"]
+    assert "chapter 21 (2 of 3 sources agree)" in msg
+    assert field(client, web.sid) == "\n".join([  # all of them, to compare
+        "myanimelist.net (web search): 21", "en.wikipedia.org (web search): 21", "kenmei.co (web search): 16"])
+
+    web.pages["https://myanimelist.net/manga/124022/Ashita_Shinu_ni_wa"] = (
+        200, MAL_PAGE.replace("Ashita Shinu ni wa, (Since I Could Die Tomorrow,)", "Tomorrows"))  # another series
+    check(client, web.sid)
+    assert "myanimelist" not in field(client, web.sid)
 
 
 def test_sources_that_disagree(client, web):

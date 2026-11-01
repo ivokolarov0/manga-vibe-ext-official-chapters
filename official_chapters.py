@@ -46,7 +46,8 @@ WEB_SEARCH = "https://html.duckduckgo.com/html/"
 PAGE_TEXT = 15000   # characters of a page's text the model gets
 RESULT_TEXT = 1000  # characters of each search result the model gets (DuckDuckGo's snippets are shorter)
 MAX_RESULTS = 15
-MAX_WEB_SOURCES = 6  # sites from a web search listed under Official sources
+MAX_WEB_SOURCES = 10  # sites from a web search listed under Official sources, to compare
+MAL_CHAPTERS_RE = re.compile(r'<span class="dark_text">Chapters:</span>\s*(\d+)')
 AI_WAIT = 180       # seconds to wait for the model's answer
 
 # Original-language sites that aren't on a .jp domain.
@@ -84,7 +85,7 @@ STORE_HOSTS = {
 # "Chapters 44-47", "第1～4話" (a volume's worth on a store page). A range counts as its last number.
 _TO = r"(?:\.\d+)?(?:\s*[-–~〜]\s*(\d+))?"
 CHAPTER_RE = re.compile(
-    rf"第\s*(\d+){_TO}\s*[話回]|(\d+){_TO}\s*話|\b(?:chapters?|chs?|episodes?|eps?)\.?:?\s*(\d+){_TO}|#\s*(\d+)",
+    rf"第\s*(\d+){_TO}\s*[話回]|(\d+){_TO}\s*話|\b(?:chapters?|chs?|episodes?|eps?)\.?\s*:?\s*\(?\s*(\d+){_TO}|#\s*(\d+)",
     re.I)
 MU_CHAPTERS_RE = re.compile(r"(\d+)\s*(?:chapters?|chs?\b|話)", re.I)
 
@@ -152,7 +153,7 @@ def page_text(raw):
 class OfficialChapters(Plugin):
     id = "official-chapters"
     name = "Official chapters"
-    version = "0.5.0"
+    version = "0.6.0"
     description = "Finds the newest chapter on the series' official sites (Japanese first) and shows it next to AniList's count."
     repo = "ivokolarov0/manga-vibe-ext-official-chapters"
     permissions = [
@@ -160,6 +161,7 @@ class OfficialChapters(Plugin):
         "Connects to api.mangaupdates.com",
         "Sends page text to your Ollama server (only if one is set)",
         "Searches DuckDuckGo for a series' titles when its links give no number (can be turned off)",
+        "Reads the series' MyAnimeList page when the web search finds it",
     ]
     fields = [FieldDef(SOURCES, "Official sources")]
     actions = [Action("check", "Check official chapters")]
@@ -376,7 +378,9 @@ class OfficialChapters(Plugin):
         queries = []
         if series.title_native:
             queries.append(f"{series.title_native} 漫画 最新話")  # "manga, newest chapter"
-        queries.append(f"{series.title_english or series.title_romaji or series.folder_name} manga latest chapter")
+        # "how many chapters" finds databases (MyAnimeList, Wikipedia, Kenmei); "latest chapter" found
+        # mostly reading sites
+        queries.append(f'"{series.title_english or series.title_romaji or series.folder_name}" manga how many chapters')
         results, seen = [], set()
         for q in queries:
             for r in self._search(ctx, q):
@@ -387,7 +391,7 @@ class OfficialChapters(Plugin):
         if not results:
             return []
 
-        found = self._read_results(ctx, titles, results)
+        found = self._read_results(ctx, titles, results) + self._from_mal(ctx, titles, results)
         names = [unicodedata.normalize("NFKC", t).casefold() for t in titles]
         for r in results:
             title = unicodedata.normalize("NFKC", r["title"]).casefold()
@@ -400,6 +404,21 @@ class OfficialChapters(Plugin):
             if n > by_site.get(_host(url), (0, None))[0]:
                 by_site[_host(url)] = (n, url)
         return sorted(by_site.values(), reverse=True)[:MAX_WEB_SOURCES]
+
+    def _from_mal(self, ctx, titles, results):
+        """[(chapters, URL)] from the first MyAnimeList manga page in the results: its "Chapters: 21"
+        (an ongoing series says "Unknown": nothing). The page's title must name the series."""
+        r = next((r for r in results if re.match(r"https?://(www\.)?myanimelist\.net/manga/\d+", r["url"])), None)
+        raw = self._get(ctx, r["url"]) if r else None
+        if not raw:
+            return []
+        page_title = re.search(r"<title>(.*?)</title>", raw, re.S)
+        if not page_title or not any(plain(t) and plain(t) in plain(html.unescape(page_title.group(1)))
+                                     for t in titles):
+            ctx.log.info("Official chapters: %s is about another series", r["url"])
+            return []
+        m = MAL_CHAPTERS_RE.search(raw)
+        return [(int(m.group(1)), r["url"])] if m and int(m.group(1)) > 0 else []
 
     def _read_results(self, ctx, titles, results):
         """[(chapter, URL)] the model reads from the search results, one per result that shows this
@@ -489,6 +508,11 @@ class OfficialChapters(Plugin):
             ctx.log.warning("Official chapters: Ollama failed (%s)", e)
             return None
         return answer if isinstance(answer, dict) else None
+
+
+def plain(text):
+    """Letters and digits only, for comparing titles: "Ashita Shinu ni wa," -> "ashitashinuniwa"."""
+    return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
 
 
 def vote(rows):
