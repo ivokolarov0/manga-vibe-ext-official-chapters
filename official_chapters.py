@@ -18,6 +18,11 @@ How a page is read:
   counts as its last number). Only a page without any goes to an Ollama model (optional, set in
   Settings), and the model's answer is only used if that number is actually on the page.
 
+When none of that gives a number, the plugin searches DuckDuckGo (its plain HTML page: free, no key).
+An official site's result title like "[第250話]ダンダダン | 少年ジャンプ＋" is read like a page;
+otherwise the Ollama model (if set) reads the results, and its number is only used if it is in the
+result the model names.
+
 Only normal requests are made, with MangaVibe's own user agent. A site that refuses them is skipped.
 """
 import html
@@ -25,7 +30,7 @@ import json
 import re
 import unicodedata
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -35,7 +40,10 @@ from app.plugins import Action, FieldDef, Plugin, SettingDef
 SOURCES = "official_sources"  # every source asked and its number, one per line, to compare
 OLD_FIELD = "official_chapters"  # version 0.1 showed the highest number on a line of its own
 MU_API = "https://api.mangaupdates.com/v1/series/"
+WEB_SEARCH = "https://html.duckduckgo.com/html/"
 PAGE_TEXT = 15000   # characters of a page's text the model gets
+RESULT_TEXT = 1000  # characters of each search result the model gets (DuckDuckGo's snippets are shorter)
+MAX_RESULTS = 15
 AI_WAIT = 180       # seconds to wait for the model's answer
 
 # Original-language sites that aren't on a .jp domain.
@@ -129,13 +137,14 @@ def page_text(raw):
 class OfficialChapters(Plugin):
     id = "official-chapters"
     name = "Official chapters"
-    version = "0.2.0"
+    version = "0.3.0"
     description = "Finds the newest chapter on the series' official sites (Japanese first) and shows it next to AniList's count."
     repo = "ivokolarov0/manga-vibe-ext-official-chapters"
     permissions = [
         "Connects to the official sites in each series' links",
         "Connects to api.mangaupdates.com",
         "Sends page text to your Ollama server (only if one is set)",
+        "Searches DuckDuckGo for a series' titles when its links give no number (can be turned off)",
     ]
     fields = [FieldDef(SOURCES, "Official sources")]
     actions = [Action("check", "Check official chapters")]
@@ -144,6 +153,9 @@ class OfficialChapters(Plugin):
         SettingDef("ollama_url", "Ollama server (optional)",
                    help="e.g. http://192.168.1.20:11434. Reads sites the plugin has no parser for. Leave empty to skip them."),
         SettingDef("model", "Model", default="gemma4", help="Any text model works, e.g. gemma4 or qwen3"),
+        SettingDef("web_search", "Web search", default="on", options=[("on", "On"), ("off", "Off")],
+                   help="When the links give no number, search DuckDuckGo for the series. Official sites' "
+                        "results are read directly; other results need the Ollama server above."),
     ]
 
     def __init__(self):
@@ -173,6 +185,8 @@ class OfficialChapters(Plugin):
             return self.progress
         last = ctx.settings.get("last_run")
         ai = "with Ollama" if ctx.setting("ollama_url") else "without Ollama (only sites it has a parser for)"
+        if ctx.setting("web_search") != "off":
+            ai += ", and searches the web when the links give no number"
         return f"Last check of all series: {last}. Reads pages {ai}." if last else f"Reads pages {ai}."
 
     def _check_all(self, ctx):
@@ -210,7 +224,7 @@ class OfficialChapters(Plugin):
         """(headline, every source asked). Every original-language site and MangaUpdates are always
         asked, so they can be compared; English sites only when those gave no number.
         The headline is the highest original-language number (a site can lag behind the others),
-        else MangaUpdates, else the highest English one."""
+        else MangaUpdates, else the highest English one, else a web search (unless it's turned off)."""
         links = ctx.db.query(Link).filter_by(series_id=series.id).all()
         by_tier = {0: [], 2: []}
         for link in links:
@@ -237,6 +251,11 @@ class OfficialChapters(Plugin):
             english = [ask(link) for link in by_tier[2]]
             rows += english
             best = max((r for r in english if r["chapters"]), key=lambda r: r["chapters"], default=None)
+        if best is None and ctx.setting("web_search") != "off":
+            n, url = self.from_web_search(ctx, series)
+            web = {"source": "Web search", "url": url, "chapters": n}
+            rows.append(web)
+            best = web if n else None
         return best, rows
 
     # ------------------------------------------------------------------ sources
@@ -297,12 +316,8 @@ class OfficialChapters(Plugin):
         return mu_chapters(data.get("status"))
 
     def from_ai(self, ctx, title, text):
-        base = str(ctx.setting("ollama_url") or "").strip().rstrip("/")
-        if not base or not text:
+        if not text:
             return None
-        if not re.match(r"^https?://", base):
-            base = "http://" + base
-        base = re.sub(r"/v1$", "", base)
         text = text[:PAGE_TEXT]
         prompt = (
             f"This is the text of an official page for the manga \"{title}\".\n"
@@ -314,10 +329,115 @@ class OfficialChapters(Plugin):
             'Answer only with JSON: {"last_chapter": <number or null>}\n\n'
             f"PAGE TEXT:\n{text}"
         )
+        answer = self._ask_model(ctx, prompt, {"last_chapter": {"type": ["integer", "null"]}})
+        n = answer.get("last_chapter") if answer else None
+        if not isinstance(n, int) or n <= 0:
+            return None
+        if not on_page(n, text):  # a made-up number is worse than none
+            ctx.log.info("Official chapters: the model said %s for %s, but that's not on the page", n, title)
+            return None
+        return n
+
+    # ------------------------------------------------------------------ web search
+    def from_web_search(self, ctx, series):
+        """(newest chapter, the result's URL) from a DuckDuckGo search; (None, None) if nothing reliable
+        was found. Results from official original-language sites whose title names the series are read
+        like a page ("[第250話]ダンダダン | 少年ジャンプ＋"); otherwise the model reads all results, and
+        its number must be in the result it points to."""
+        titles = [t for t in (series.title_native, series.title_english, series.title_romaji) if t]
+        if not titles:
+            titles = [series.folder_name]
+        queries = []
+        if series.title_native:
+            queries.append(f"{series.title_native} 漫画 最新話")  # "manga, newest chapter"
+        queries.append(f"{series.title_english or series.title_romaji or series.folder_name} manga latest chapter")
+        results, seen = [], set()
+        for q in queries:
+            for r in self._search(ctx, q):
+                if r["url"] not in seen:
+                    seen.add(r["url"])
+                    results.append(r)
+        results = results[:MAX_RESULTS]
+        if not results:
+            return None, None
+
+        n, url = self._read_results(ctx, titles, results)
+        if n:
+            return n, url
+        # no model, or no answer from it: the official sites' own result titles
+        names = [unicodedata.normalize("NFKC", t).casefold() for t in titles]
+        official = []
+        for r in results:
+            title = unicodedata.normalize("NFKC", r["title"]).casefold()
+            # only the known official sites: other .jp pages include spoiler blogs ("第251話ネタバレ")
+            n = newest([r["title"]]) if _host(r["url"]) in ORIGINAL_HOSTS and any(t in title for t in names) else None
+            if n:
+                official.append((n, r["url"]))
+        return max(official) if official else (None, None)
+
+    def _read_results(self, ctx, titles, results):
+        """(chapter, URL) the model reads from the search results, or (None, None). Its number must be
+        a chapter label (第250話, Chapter 250) in the result it names, or else in another result: a bare
+        number could be an anime season or a date."""
+        def seen(r):  # what the model gets of a result
+            return f"{r['title']} {r['content'][:RESULT_TEXT]}"
+
+        listing = "\n\n".join(f"RESULT {i}: {r['title']}\nURL: {r['url']}\n{r['content'][:RESULT_TEXT]}"
+                              for i, r in enumerate(results, 1))
+        names = " / ".join(f'"{t}"' for t in titles)
+        prompt = (
+            f"These are web search results about the manga (Japanese comic) {names}.\n"
+            "What is the number of the newest regular chapter of this manga released so far in its original "
+            "language (Japanese, Korean or Chinese)?\n"
+            "Only use results about this exact manga. Ignore results about its anime (episode counts), "
+            "light novel, a different series with a similar name, volume counts, and English release counts "
+            "if the original is further along. Ignore extras, specials and side stories. Ignore spoiler and "
+            "prediction pages (ネタバレ, 予想, raw), which name chapters that aren't out yet.\n"
+            "Prefer official sites and MangaUpdates. If the results disagree, take the highest number a "
+            "reliable result shows. If no result shows it, answer null. Do not guess.\n"
+            "Answer only with JSON: "
+            '{"last_chapter": <the chapter number, or null>, '
+            f'"result_number": <which RESULT shows it, from 1 to {len(results)} (the number after the word '
+            'RESULT, not the chapter number), or null>}\n\n' + listing
+        )
+        answer = self._ask_model(ctx, prompt, {"last_chapter": {"type": ["integer", "null"]},
+                                               "result_number": {"type": ["integer", "null"]}})
+        n, i = (answer.get("last_chapter"), answer.get("result_number")) if answer else (None, None)
+        if not isinstance(n, int) or n <= 0:
+            return None, None
+        named = [results[i - 1]] if isinstance(i, int) and 1 <= i <= len(results) else []
+        for r in named + results:
+            if n in chapter_numbers([seen(r)]):
+                return n, r["url"]
+        ctx.log.info("Official chapters: the model said %s for %s, but no search result shows it", n, titles[0])
+        return None, None
+
+    @staticmethod
+    def _search(ctx, query):
+        """DuckDuckGo's results: [{title, url, content}], or [] if it failed or refused."""
+        try:
+            raw = ctx.http.request("GET", WEB_SEARCH, retries=1, params={"q": query}).text
+        except ctx.http.ProviderError as e:
+            ctx.log.warning("Official chapters: web search failed: %s", e)
+            return []
+        results = search_results(raw)
+        if not results and re.search(r"anomaly|challenge", raw, re.I):
+            ctx.log.warning("Official chapters: DuckDuckGo asked to confirm a human is searching; skipped")
+        return results
+
+    # ------------------------------------------------------------------ the model
+    @staticmethod
+    def _ask_model(ctx, prompt, properties):
+        """The model's JSON answer (a dict), or None if no Ollama server is set or it failed."""
+        base = str(ctx.setting("ollama_url") or "").strip().rstrip("/")
+        if not base:
+            return None
+        if not re.match(r"^https?://", base):
+            base = "http://" + base
+        base = re.sub(r"/v1$", "", base)
         body = {"model": ctx.setting("model") or "gemma4", "stream": False, "think": False,
                 "messages": [{"role": "user", "content": prompt}],
-                "format": {"type": "object", "properties": {"last_chapter": {"type": ["integer", "null"]}},
-                           "required": ["last_chapter"]},
+                "format": {"type": "object", "properties": properties, "required": list(properties)},
                 "options": {"temperature": 0}}
         try:
             with httpx.Client(timeout=httpx.Timeout(AI_WAIT, connect=15), transport=ctx.http.transport) as c:
@@ -330,11 +450,28 @@ class OfficialChapters(Plugin):
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
             ctx.log.warning("Official chapters: Ollama failed (%s)", e)
             return None
-        n = answer.get("last_chapter") if isinstance(answer, dict) else None
-        if not isinstance(n, int) or n <= 0:
-            return None
-        # a made-up number is worse than none: it must be on the page
-        if not re.search(rf"(?<!\d){n}(?!\d)", unicodedata.normalize("NFKC", text)):
-            ctx.log.info("Official chapters: the model said %s for %s, but that's not on the page", n, title)
-            return None
-        return n
+        return answer if isinstance(answer, dict) else None
+
+
+def search_results(raw):
+    """The results on a DuckDuckGo HTML page, without ads: [{title, url, content}]."""
+    out = []
+    for block in re.split(r'<div class="result results_links', raw)[1:]:
+        if "result--ad" in block[:200]:
+            continue
+        link = re.search(r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not link:
+            continue
+        href = html.unescape(link.group(1))
+        url = (parse_qs(urlparse(href).query).get("uddg") or [href])[0]  # DuckDuckGo's redirect link
+        if not url.startswith("http") or _host(url).endswith("duckduckgo.com"):
+            continue
+        snippet = re.search(r'class="result__snippet"[^>]*>(.*?)</(?:a|div)>', block, re.S)
+        out.append({"title": page_text(link.group(2)), "url": url,
+                    "content": page_text(snippet.group(1)) if snippet else ""})
+    return out
+
+
+def on_page(n, text):
+    """Is the number n written in the text (full-width digits count)?"""
+    return bool(re.search(rf"(?<!\d){n}(?!\d)", unicodedata.normalize("NFKC", text)))

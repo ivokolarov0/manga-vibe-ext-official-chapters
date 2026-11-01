@@ -26,14 +26,39 @@ class FakeWeb:
         self.pages = {}       # url -> (status, text)
         self.asked = []       # urls requested, in order
         self.ai_answer = None  # what Ollama says
+        self.ai_result = None  # which search result the model points to
+        self.search_results = []  # what DuckDuckGo finds: [(title, url, snippet)]
+        self.searches = []        # what was searched for
+        self.prompts = []         # what the model was asked
 
     def __call__(self, request: httpx.Request):
         url = str(request.url)
         self.asked.append(url)
         if url.endswith("/api/chat"):
-            return httpx.Response(200, json={"message": {"content": json.dumps({"last_chapter": self.ai_answer})}})
+            self.prompts.append(json.loads(request.content)["messages"][0]["content"])
+            answer = {"last_chapter": self.ai_answer, "result_number": self.ai_result}
+            return httpx.Response(200, json={"message": {"content": json.dumps(answer)}})
+        if url.startswith("https://html.duckduckgo.com/html/"):
+            self.searches.append(request.url.params.get("q"))
+            return httpx.Response(200, text=ddg_page(self.search_results))
         status, text = self.pages.get(url, (404, "not found"))
         return httpx.Response(status, text=text)
+
+
+def ddg_page(results):
+    """A DuckDuckGo HTML results page (the same markup as html.duckduckgo.com), with an ad first."""
+    from urllib.parse import quote
+    blocks = ['<div class="result results_links results_links_deep result--ad "><h2 class="result__title">'
+              '<a rel="nofollow" class="result__a" href="https://duckduckgo.com/y.js?ad_domain=shop.example">'
+              'Buy 第999話 now</a></h2></div>']
+    for title, url, snippet in results:
+        link = f"//duckduckgo.com/l/?uddg={quote(url, safe='')}&amp;rut=abc"
+        blocks.append(
+            f'<div class="result results_links results_links_deep web-result ">'
+            f'<div class="links_main links_deep result__body"><h2 class="result__title">'
+            f'<a rel="nofollow" class="result__a" href="{link}">{title}</a></h2>'
+            f'<a class="result__snippet" href="{link}">{snippet}</a></div></div>')
+    return "<html><body>" + "".join(blocks) + "</body></html>"
 
 
 def import_plugin():
@@ -212,3 +237,100 @@ def test_without_ollama_other_pages_are_skipped(client, web):
     set_links(web.sid, [("ComicWalker", "https://comic-walker.com/detail/2")], mangaupdates_id=None)
     assert "No official chapter count" in check(client, web.sid)["message"]
     assert not any(u.endswith("/api/chat") for u in web.asked)
+
+
+# ---------------------------------------------------------------- web search
+
+def settings(**values):
+    from app.db import SessionLocal
+    from app.plugins import Context, manager
+    with SessionLocal() as db:
+        Context(manager.get(PID), db).save_settings(values)
+        db.commit()
+
+
+def no_links(web):
+    set_links(web.sid, [], mangaupdates_id=None, title_native="ダンダダン", title_english="Series B")
+
+
+def test_search_results_page():
+    m = import_plugin()
+    found = m.search_results(ddg_page([("[第250話]ダンダダン - 龍幸伸 | 少年ジャンプ＋",
+                                        "https://shonenjumpplus.com/series/ew102085/latest_free_episode",
+                                        "ダンダダンの<b>最新話</b>")]))
+    assert found == [{"title": "[第250話]ダンダダン - 龍幸伸 | 少年ジャンプ＋",  # the ad is left out
+                      "url": "https://shonenjumpplus.com/series/ew102085/latest_free_episode",
+                      "content": "ダンダダンの 最新話"}]
+
+
+def test_official_result_titles_are_read_without_a_model(client, web):
+    no_links(web)  # no Ollama server set
+    web.search_results = [
+        ("ダンダダン 第251話ネタバレ", "https://spoiler.example.jp/dandadan-251", "最新話の予想"),  # not official
+        ("[第219話]ダンダダン - 龍幸伸 | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/219", ""),
+        ("[第250話]ダンダダン - 龍幸伸 | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/250", ""),
+        ("[第300話]ほかの漫画 | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/300", ""),  # another series
+    ]
+    msg = check(client, web.sid)["message"]
+    assert "chapter 250 (Web search)" in msg
+    assert field(client, web.sid) == "Web search: 250"
+    assert web.searches[0] == "ダンダダン 漫画 最新話" and "Series B manga latest chapter" in web.searches
+
+
+def test_the_model_reads_other_results(client, web):
+    settings(ollama_url="pc:11434")
+    set_links(web.sid, [("ComicWalker", "https://comic-walker.com/detail/4")], mangaupdates_id=None,
+              title_native="ダンダダン", title_english="Series B")
+    web.pages["https://comic-walker.com/detail/4"] = (403, "Forbidden")
+    web.search_results = [("ダンダダン アニメ", "https://anime.example/dandadan", "TVアニメ第2期 2025年放送"),
+                          ("ダンダダン 最新話 | コミシー", "https://comicy.jp/comic/view/3018",
+                           "最新話は[第２５０話]ダンダダン（2026年10月27日公開）")]
+    web.ai_answer, web.ai_result = 250, 2
+    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]
+    assert field(client, web.sid) == "Web search: 250\nComicWalker: no chapter number found"
+    assert "RESULT 2: ダンダダン 最新話" in web.prompts[-1] and "ネタバレ" in web.prompts[-1]
+
+    # gemma4 once gave the chapter as the result number: the chapter label in result 2 still counts
+    web.ai_answer, web.ai_result = 250, 250
+    assert "chapter 250 (Web search)" in check(client, web.sid)["message"]
+    web.ai_answer, web.ai_result = 2, 1  # "第2期" is the anime's season, not a chapter label
+    assert "No official chapter count" in check(client, web.sid)["message"]
+    assert field(client, web.sid) == "ComicWalker: no chapter number found\nWeb search: no chapter number found"
+    web.ai_answer, web.ai_result = 999, 9  # made up, and there's no result 9
+    assert "No official chapter count" in check(client, web.sid)["message"]
+
+
+def test_the_model_comes_before_official_titles(client, web):
+    settings(ollama_url="pc:11434")
+    no_links(web)
+    web.search_results = [("[第249話]ダンダダン | 少年ジャンプ＋", "https://shonenjumpplus.com/episode/249", ""),
+                          ("ダンダダン | コミシー", "https://comicy.jp/comic/view/3018", "最新話は第250話")]
+    web.ai_answer, web.ai_result = 250, 2
+    assert field_after_check(client, web) == "Web search: 250"
+    web.ai_answer, web.ai_result = None, None  # no answer: the official title instead
+    assert field_after_check(client, web) == "Web search: 249"
+
+
+def field_after_check(client, web):
+    check(client, web.sid)
+    return field(client, web.sid)
+
+
+def test_no_web_search_when_the_links_have_a_number_or_its_off(client, web):
+    web.pages["https://piccoma.com/web/product/9"] = (200, "<li>第198話</li>")
+    set_links(web.sid, [("Piccoma", "https://piccoma.com/web/product/9")], mangaupdates_id=None)
+    check(client, web.sid)
+    assert field(client, web.sid) == "Piccoma: 198"
+    assert not web.searches
+
+    settings(web_search="off")
+    no_links(web)
+    assert "No official chapter count" in check(client, web.sid)["message"]
+    assert not web.searches
+
+
+def test_search_refused(client, web):
+    no_links(web)
+    web.search_results = []
+    assert "No official chapter count" in check(client, web.sid)["message"]  # nothing found: not fatal
+    assert web.searches
