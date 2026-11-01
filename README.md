@@ -44,6 +44,7 @@ How each page is read:
 | Manga UP! | the chapter list in the page's data |
 | any other site | the chapter labels in the page's text (`第12話`, `Chapter 12`, `Chapters 44-47`) |
 | a page without any | its text goes to your Ollama model, if you set one (see below) |
+| no link gave a number | a DuckDuckGo search, read by your Ollama model (see below) |
 
 Extras, specials, previews and announcements without a number are left out. `Chapter 44.4`
 counts as chapter 44, and a range like `Chapters 44-47` (a store's volume) as 47.
@@ -63,6 +64,25 @@ shown.
 Some sites show their chapter list only after JavaScript runs, or refuse requests that don't come
 from a browser (MANGA Plus does). The plugin doesn't try to get around that; it moves on to the
 next link.
+
+## Web search (optional)
+
+When none of the series' links gives a number, the plugin searches DuckDuckGo (its plain HTML page:
+free, no account or key). It searches for the Japanese title with 漫画 最新話 ("manga, newest
+chapter") and for the English title with "manga latest chapter".
+
+- **With an Ollama server set**, your model reads the results. It's told to ignore anime episodes,
+  light novels, spoiler pages and series with similar names. Its number is only used if a result
+  shows it as a chapter label (`第250話`, `Chapter 250`), so a made-up number or an anime season
+  is never shown.
+- **Without one** (or if the model has no answer), the plugin reads the titles of results from the
+  official sites, e.g. `[第250話]ダンダダン | 少年ジャンプ＋`.
+
+The result shows as `Web search: 250` under **Official sources**. The **Web search** setting turns
+it off.
+
+DuckDuckGo sometimes asks automated searches to prove they're human. The plugin doesn't try to get
+around that: the search is skipped (a warning in the log) and the series gets no number from it.
 
 ## Install
 
